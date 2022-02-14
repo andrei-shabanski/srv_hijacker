@@ -1,5 +1,7 @@
 import re
 
+import itertools
+import random
 import socket
 from socket import gaierror as SocketError
 from functools import wraps
@@ -23,10 +25,19 @@ def resolve_ip(rrsets, old_host):
 
 
 def resolve_srv_record(old_host, srv_resolver):
-    ans = srv_resolver.resolve(old_host, "SRV")
+    try:
+        answers = srv_resolver.resolve(old_host, "SRV")
+    except resolver.NoAnswer:
+        # No SRV record. Client must try to resolve A \ CNAME record instead
+        return None
 
-    new_port = ans[0].port
-    new_host = resolve_ip(ans.response.additional, old_host)
+    # TODO: Should we go through each answer to search alive "server"?
+    by_priority_func = lambda ans: ans.priority
+    answers_by_priority = itertools.groupby(sorted(answers, key=by_priority_func), key=by_priority_func)
+    answer = random.choice(tuple(next(answers_by_priority)[1]))
+
+    new_port = answer.port
+    new_host = str(answer.target)  # TODO: AWS Private VPC returns CNAME-like record that a client must resolve
 
     logger.debug(
         "Resolved SRV record for host %s: (%s:%s)", old_host, new_host, new_port
@@ -51,7 +62,9 @@ def patched_socket_getaddrinfo(host_regex, srv_resolver):
     def patched_f(host, port, family=0, type=0, proto=0, flags=0):
         if re.search(host_regex, host):
             logger.debug("TCP host %s matched SRV regex, resolving", host)
-            host, port = resolve_srv_record(host, srv_resolver)
+            host_and_port = resolve_srv_record(host, srv_resolver)
+            if host_and_port:
+                host, port = host_and_port
         else:
             logger.debug("TCP host %s did not match SRV regex, ignoring", host)
 
@@ -92,9 +105,10 @@ def _patch_psycopg2(host_regex, srv_resolver):
 
             if re.search(host_regex, host):
                 logger.debug("Host %s matched SRV regex, resolving", host)
-                host, port = resolve_srv_record(host, srv_resolver)
-                config["host"] = host
-                config["port"] = port
+                host_and_port = resolve_srv_record(host,  srv_resolver)
+                if host_and_port:
+                    config["host"] = host_and_port[0]
+                    config["port"] = host_and_port[1]
 
             dsn = make_dsn(**config)
 
