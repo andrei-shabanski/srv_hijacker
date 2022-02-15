@@ -119,8 +119,51 @@ def _patch_psycopg2(host_regex, srv_resolver):
     psycopg2._connect = patch_psycopg2_connect(psycopg2._connect)
 
 
+def _patch_asyncpg(host_regex, srv_resolver):
+    try:
+        import asyncpg
+        from asyncpg.connect_utils import _parse_connect_dsn_and_args
+    except ImportError as e:
+        raise PatchError(f"failed to import asyncpg. {e}")
+
+    def patch_asyncpg_connect(fn):
+        @wraps(fn)
+        async def wrapper(dsn=None, **kwargs):
+            addrs, _ = _parse_connect_dsn_and_args(
+                dsn=dsn,
+                host=kwargs.get('host'),
+                port=kwargs.get('port'),
+                user=kwargs.get('user'),
+                password=kwargs.get('password'),
+                passfile=kwargs.get('passfile'),
+                database=kwargs.get('database'),
+                ssl=kwargs.get('ssl'),
+                connect_timeout=kwargs.get('connect_timeout'),
+                server_settings=kwargs.get('server_settings'),
+            )
+
+            if not addrs:
+                logger.error("Could not resolve %s SRV record")
+                return fn(dsn=dns, **kwargs)
+
+            host, port = addrs[0]
+            if re.search(host_regex, host):
+                logger.debug("Host %s matched SRV regex, resolving", host)
+                host_and_port = resolve_srv_record(host,  srv_resolver)
+                if host_and_port:
+                    kwargs["host"] = host_and_port[0]
+                    kwargs["port"] = host_and_port[1]
+
+            return await fn(dsn=None, **kwargs)
+
+        return wrapper
+
+    asyncpg.connect = patch_asyncpg_connect(asyncpg.connect)
+
+
 PATCHABLE_LIBS = {
     "psycopg2": _patch_psycopg2,
+    "asyncpg": _patch_asyncpg,
 }
 
 
